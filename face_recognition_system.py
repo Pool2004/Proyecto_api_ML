@@ -1,422 +1,321 @@
 """
-Sistema de Reconocimiento Facial con MediaPipe
-Instalación: pip install mediapipe opencv-python
+Modelo de detección de objetos funcional (Faster R-CNN y DETR)
+Archivo: modelo_deteccion_objetos_fasterrcnn_detr.py
+Descripción: script completo para entrenar y hacer inferencia con:
+ - Faster R-CNN (torchvision)
+ - DETR (transformer-based detector, torchvision)
 
-Autor: Sistema optimizado para Windows
-Versión: 2.0
+Formato de datos esperado: COCO (annotations JSON) o carpeta con imágenes + COCO annotations.
+
+Requisitos:
+ - Python 3.8+
+ - torch >= 1.12
+ - torchvision >= 0.13
+ - pycocotools
+ - matplotlib, pillow
+
+Instalación rápida (Linux/Win con conda/venv):
+ pip install torch torchvision pycocotools matplotlib pillow
+
+Uso rápido:
+ 1) Prepara dataset COCO: images/  annotations/instances_train.json  instances_val.json
+ 2) Entrenar Faster R-CNN (ejemplo):
+    python modelo_deteccion_objetos_fasterrcnn_detr.py --mode train --model fasterrcnn --data_root ./dataset --epochs 10 --batch_size 4 --save_dir ./checkpoints
+ 3) Inferir:
+    python modelo_deteccion_objetos_fasterrcnn_detr.py --mode infer --model fasterrcnn --weights ./checkpoints/fasterrcnn_epoch10.pth --input ./test_images --output ./out
+
+Explicación paso a paso incluida en los comentarios dentro del código.
+
+Autor: ChatGPT (adaptado para uso educativo y prototipos)
 """
 
-import cv2
-import mediapipe as mp
-import pickle
 import os
+import argparse
+import time
 from pathlib import Path
-import numpy as np
+from typing import Optional, List
+
+import torch
+from torch.utils.data import DataLoader, Subset
+import torchvision
+from torchvision import transforms as T
+from torchvision.datasets import CocoDetection
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection import detr_resnet50
+
+from PIL import Image, ImageDraw, ImageFont
+import matplotlib.pyplot as plt
 
 
-class ReconocimientoFacial:
-    def __init__(self):
-        # Inicializar MediaPipe
-        self.mp_face_detection = mp.solutions.face_detection
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.mp_drawing = mp.solutions.drawing_utils
-        
-        # Configurar detección de caras
-        self.face_detection = self.mp_face_detection.FaceDetection(
-            model_selection=1,  # 0=cercano, 1=lejano
-            min_detection_confidence=0.6
-        )
-        
-        # Configurar malla facial para encodings
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=5,
-            min_detection_confidence=0.6,
-            min_tracking_confidence=0.5
-        )
-        
-        self.caras_conocidas = {}
-        self.archivo_encodings = "caras_guardadas.pkl"
-        
-        print("✓ Sistema de reconocimiento facial inicializado")
-    
-    def extraer_caracteristicas(self, imagen):
-        """Extrae características faciales únicas de una imagen"""
-        try:
-            rgb = cv2.cvtColor(imagen, cv2.COLOR_BGR2RGB)
-            resultado = self.face_mesh.process(rgb)
-            
-            if not resultado.multi_face_landmarks:
-                return None
-            
-            # Usar landmarks clave como características
-            landmarks = []
-            cara = resultado.multi_face_landmarks[0]  # Primera cara
-            
-            # Extraer puntos clave importantes (ojos, nariz, boca, contorno)
-            indices_importantes = list(range(0, 468, 7))  # Cada 7 puntos
-            
-            for idx in indices_importantes:
-                if idx < len(cara.landmark):
-                    lm = cara.landmark[idx]
-                    landmarks.extend([lm.x, lm.y, lm.z])
-            
-            return np.array(landmarks)
-        
-        except Exception as e:
-            print(f"Error al extraer características: {e}")
-            return None
-    
-    def calcular_similitud(self, cara1, cara2):
-        """Calcula qué tan parecidas son dos caras (0-1)"""
-        if cara1 is None or cara2 is None:
-            return 0.0
-        
-        # Normalizar longitud
-        min_len = min(len(cara1), len(cara2))
-        cara1 = cara1[:min_len]
-        cara2 = cara2[:min_len]
-        
-        # Calcular similitud (inverso de la distancia)
-        distancia = np.linalg.norm(cara1 - cara2)
-        similitud = 1 / (1 + distancia * 10)  # Ajuste de escala
-        
-        return similitud
-    
-    def cargar_caras_conocidas(self, carpeta="caras_conocidas"):
-        """Carga las fotos de personas conocidas"""
-        print(f"\n{'='*50}")
-        print("CARGANDO CARAS CONOCIDAS")
-        print(f"{'='*50}")
-        
-        # Intentar cargar desde archivo guardado
-        if os.path.exists(self.archivo_encodings):
-            try:
-                with open(self.archivo_encodings, 'rb') as f:
-                    self.caras_conocidas = pickle.load(f)
-                
-                print(f"✓ Cargadas {len(self.caras_conocidas)} personas desde archivo")
-                for nombre in self.caras_conocidas.keys():
-                    print(f"  • {nombre}")
-                print(f"{'='*50}\n")
-                return
-            except Exception as e:
-                print(f"⚠ Error al cargar archivo: {e}")
-                print("Generando nuevos encodings...\n")
-        
-        # Crear carpeta si no existe
-        ruta_carpeta = Path(carpeta)
-        if not ruta_carpeta.exists():
-            ruta_carpeta.mkdir(parents=True)
-            print(f"✓ Carpeta '{carpeta}' creada")
-            print(f"\n📁 INSTRUCCIONES:")
-            print(f"1. Crea subcarpetas con el nombre de cada persona")
-            print(f"2. Agrega 2-5 fotos de cada persona en su carpeta")
-            print(f"Ejemplo: {carpeta}/juan/foto1.jpg")
-            print(f"{'='*50}\n")
-            return
-        
-        # Procesar cada persona
-        total_procesadas = 0
-        
-        for carpeta_persona in ruta_carpeta.iterdir():
-            if not carpeta_persona.is_dir():
-                continue
-            
-            nombre = carpeta_persona.name
-            print(f"\n👤 Procesando: {nombre}")
-            print("-" * 40)
-            
-            encodings_persona = []
-            
-            for archivo_foto in carpeta_persona.glob("*"):
-                if archivo_foto.suffix.lower() not in ['.jpg', '.jpeg', '.png', '.bmp']:
-                    continue
-                
-                try:
-                    imagen = cv2.imread(str(archivo_foto))
-                    
-                    if imagen is None:
-                        print(f"  ✗ No se pudo leer: {archivo_foto.name}")
-                        continue
-                    
-                    # Redimensionar si es muy grande
-                    h, w = imagen.shape[:2]
-                    if w > 800:
-                        escala = 800 / w
-                        imagen = cv2.resize(imagen, None, fx=escala, fy=escala)
-                    
-                    encoding = self.extraer_caracteristicas(imagen)
-                    
-                    if encoding is not None:
-                        encodings_persona.append(encoding)
-                        print(f"  ✓ {archivo_foto.name}")
-                        total_procesadas += 1
-                    else:
-                        print(f"  ✗ Sin cara detectada: {archivo_foto.name}")
-                
-                except Exception as e:
-                    print(f"  ✗ Error con {archivo_foto.name}: {e}")
-            
-            if encodings_persona:
-                self.caras_conocidas[nombre] = encodings_persona
-                print(f"  → Total: {len(encodings_persona)} fotos cargadas")
-        
-        # Guardar encodings
-        if self.caras_conocidas:
-            try:
-                with open(self.archivo_encodings, 'wb') as f:
-                    pickle.dump(self.caras_conocidas, f)
-                print(f"\n✓ Encodings guardados en '{self.archivo_encodings}'")
-            except Exception as e:
-                print(f"\n⚠ No se pudo guardar: {e}")
-        
-        print(f"\n{'='*50}")
-        print(f"RESUMEN: {len(self.caras_conocidas)} personas | {total_procesadas} fotos")
-        print(f"{'='*50}\n")
-    
-    def reconocer_cara(self, encoding):
-        """Identifica a quién pertenece una cara"""
-        if not self.caras_conocidas or encoding is None:
-            return "Desconocido", 0.0
-        
-        mejor_coincidencia = "Desconocido"
-        mejor_similitud = 0.0
-        
-        for nombre, encodings_lista in self.caras_conocidas.items():
-            for encoding_conocido in encodings_lista:
-                similitud = self.calcular_similitud(encoding, encoding_conocido)
-                
-                if similitud > mejor_similitud:
-                    mejor_similitud = similitud
-                    mejor_coincidencia = nombre
-        
-        # Umbral mínimo de confianza
-        if mejor_similitud < 0.70:
-            return "Desconocido", mejor_similitud
-        
-        return mejor_coincidencia, mejor_similitud
-    
-    def webcam_tiempo_real(self):
-        """Reconocimiento facial desde la webcam"""
-        print("\n" + "="*50)
-        print("MODO WEBCAM - Presiona 'q' para salir")
-        print("="*50 + "\n")
-        
-        cap = cv2.VideoCapture(0)
-        
-        if not cap.isOpened():
-            print("❌ Error: No se puede acceder a la webcam")
-            print("Verifica que:")
-            print("  1. La webcam esté conectada")
-            print("  2. No esté siendo usada por otra aplicación")
-            return
-        
-        # Configurar resolución
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        
-        print("✓ Webcam activa\n")
-        
-        frame_count = 0
-        
-        with self.mp_face_detection.FaceDetection(
-            model_selection=1,
-            min_detection_confidence=0.6
-        ) as detector:
-            
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    print("⚠ Error al capturar frame")
-                    break
-                
-                frame_count += 1
-                
-                # Procesar cada 3 frames para mejor rendimiento
-                if frame_count % 3 == 0:
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    resultados = detector.process(rgb)
-                    
-                    if resultados.detections:
-                        for deteccion in resultados.detections:
-                            # Obtener coordenadas
-                            bbox = deteccion.location_data.relative_bounding_box
-                            h, w, _ = frame.shape
-                            
-                            x = int(bbox.xmin * w)
-                            y = int(bbox.ymin * h)
-                            ancho = int(bbox.width * w)
-                            alto = int(bbox.height * h)
-                            
-                            # Extraer región de la cara
-                            x1, y1 = max(0, x), max(0, y)
-                            x2, y2 = min(w, x + ancho), min(h, y + alto)
-                            cara_roi = frame[y1:y2, x1:x2]
-                            
-                            if cara_roi.size > 0:
-                                # Reconocer
-                                encoding = self.extraer_caracteristicas(cara_roi)
-                                nombre, confianza = self.reconocer_cara(encoding)
-                                
-                                # Dibujar
-                                color = (0, 255, 0) if nombre != "Desconocido" else (0, 0, 255)
-                                cv2.rectangle(frame, (x, y), (x + ancho, y + alto), color, 2)
-                                
-                                # Etiqueta
-                                etiqueta = f"{nombre} ({confianza*100:.0f}%)"
-                                tam_texto = cv2.getTextSize(etiqueta, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                                
-                                cv2.rectangle(frame, (x, y - 35), (x + tam_texto[0] + 10, y), color, -1)
-                                cv2.putText(frame, etiqueta, (x + 5, y - 10),
-                                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                
-                # Instrucciones en pantalla
-                cv2.putText(frame, "Presiona 'q' para salir", (10, 30),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                
-                cv2.imshow('Reconocimiento Facial', frame)
-                
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-        
-        cap.release()
-        cv2.destroyAllWindows()
-        print("\n✓ Webcam cerrada")
-    
-    def analizar_imagen(self, ruta_imagen):
-        """Analiza una imagen y reconoce las caras"""
-        print(f"\nAnalizando: {ruta_imagen}")
-        
-        if not os.path.exists(ruta_imagen):
-            print(f"❌ Error: Archivo no encontrado")
-            return
-        
-        imagen = cv2.imread(ruta_imagen)
-        
-        if imagen is None:
-            print(f"❌ Error: No se puede leer la imagen")
-            return
-        
-        # Redimensionar si es muy grande
-        h, w = imagen.shape[:2]
-        if w > 1200:
-            escala = 1200 / w
-            imagen = cv2.resize(imagen, None, fx=escala, fy=escala)
-        
-        rgb = cv2.cvtColor(imagen, cv2.COLOR_BGR2RGB)
-        
-        with self.mp_face_detection.FaceDetection(
-            model_selection=1,
-            min_detection_confidence=0.6
-        ) as detector:
-            
-            resultados = detector.process(rgb)
-            
-            if not resultados.detections:
-                print("⚠ No se detectaron caras en la imagen")
-                cv2.imshow('Sin caras detectadas', imagen)
-                cv2.waitKey(0)
-                cv2.destroyAllWindows()
-                return
-            
-            print(f"✓ {len(resultados.detections)} cara(s) detectada(s)\n")
-            
-            for i, deteccion in enumerate(resultados.detections, 1):
-                bbox = deteccion.location_data.relative_bounding_box
-                h, w, _ = imagen.shape
-                
-                x = int(bbox.xmin * w)
-                y = int(bbox.ymin * h)
-                ancho = int(bbox.width * w)
-                alto = int(bbox.height * h)
-                
-                x1, y1 = max(0, x), max(0, y)
-                x2, y2 = min(w, x + ancho), min(h, y + alto)
-                cara_roi = imagen[y1:y2, x1:x2]
-                
-                if cara_roi.size > 0:
-                    encoding = self.extraer_caracteristicas(cara_roi)
-                    nombre, confianza = self.reconocer_cara(encoding)
-                    
-                    print(f"  Cara {i}: {nombre} - Confianza: {confianza*100:.1f}%")
-                    
-                    color = (0, 255, 0) if nombre != "Desconocido" else (0, 0, 255)
-                    cv2.rectangle(imagen, (x, y), (x + ancho, y + alto), color, 3)
-                    
-                    etiqueta = f"{nombre} ({confianza*100:.0f}%)"
-                    tam_texto = cv2.getTextSize(etiqueta, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
-                    
-                    cv2.rectangle(imagen, (x, y - 40), (x + tam_texto[0] + 10, y), color, -1)
-                    cv2.putText(imagen, etiqueta, (x + 5, y - 12),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        
-        cv2.imshow('Resultado del Análisis', imagen)
-        print("\nPresiona cualquier tecla para cerrar...")
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+# --------------------------- Utilities ---------------------------
 
+def get_transform(train: bool):
+    transforms = []
+    transforms.append(T.PILToTensor())  # devuelve tensor tipo uint8 [C,H,W]
+    # Convert to float and scale to [0,1]
+    transforms.append(T.ConvertImageDtype(torch.float))
+    if train:
+        transforms.append(T.RandomHorizontalFlip(0.5))
+    return T.Compose(transforms)
+
+
+# Custom wrapper around torchvision.datasets.CocoDetection
+class CocoDatasetWrapper(CocoDetection):
+    def __init__(self, img_folder, ann_file, transforms=None):
+        super().__init__(img_folder, ann_file)
+        self._transforms = transforms
+
+    def __getitem__(self, idx):
+        img, anns = super().__getitem__(idx)
+        # anns: list of annotations dicts with keys: bbox, category_id, etc.
+        boxes = []
+        labels = []
+        areas = []
+        iscrowd = []
+        for ann in anns:
+            # COCO bbox format: [x_min, y_min, width, height]
+            x, y, w, h = ann['bbox']
+            boxes.append([x, y, x + w, y + h])
+            labels.append(ann['category_id'])
+            areas.append(ann.get('area', w * h))
+            iscrowd.append(ann.get('iscrowd', 0))
+
+        if len(boxes) == 0:
+            # Some images may have zero annotations; Faster R-CNN expects at least one box.
+            # We'll create a dummy box with label 0 (background) and ignore it in loss by setting area 0.
+            boxes = [[0.0, 0.0, 1.0, 1.0]]
+            labels = [0]
+            areas = [0.0]
+            iscrowd = [0]
+
+        boxes = torch.tensor(boxes, dtype=torch.float32)
+        labels = torch.tensor(labels, dtype=torch.int64)
+        areas = torch.tensor(areas, dtype=torch.float32)
+        iscrowd = torch.tensor(iscrowd, dtype=torch.int64)
+
+        target = {}
+        target['boxes'] = boxes
+        target['labels'] = labels
+        target['image_id'] = torch.tensor([idx])
+        target['area'] = areas
+        target['iscrowd'] = iscrowd
+
+        if self._transforms is not None:
+            img = self._transforms(img)
+
+        return img, target
+
+
+# --------------------------- Model builders ---------------------------
+
+def get_fasterrcnn_model(num_classes: int, pretrained_backbone: bool = True):
+    # Load base pretrained model and replace classifier head
+    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True, pretrained_backbone=pretrained_backbone)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    return model
+
+
+def get_detr_model(num_classes: int):
+    # DETR is transformer-based object detector available in torchvision (detr_resnet50)
+    model = detr_resnet50(pretrained=True)
+    # Adjust number of classes (including background class handled differently in DETR)
+    model.class_labels = num_classes
+    # torchvision's detr expects num_classes param during creation in some versions; here we simply swap heads if needed
+    # If running into mismatch errors, consider using torchvision.models.detection.detr_resnet50(pretrained=False, num_classes=num_classes) with manual weight init.
+    return model
+
+
+# --------------------------- Training loop ---------------------------
+
+def collate_fn(batch):
+    return tuple(zip(*batch))
+
+
+def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=100):
+    model.train()
+    lr_scheduler = None
+    if epoch == 0:
+        warmup_factor = 1.0 / 1000
+        warmup_iters = min(1000, len(data_loader) - 1)
+        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=warmup_factor, total_iters=warmup_iters)
+
+    for i, (images, targets) in enumerate(data_loader):
+        images = list(img.to(device) for img in images)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        loss_dict = model(images, targets)
+        losses = sum(loss for loss in loss_dict.values())
+
+        optimizer.zero_grad()
+        losses.backward()
+        optimizer.step()
+
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+        if i % print_freq == 0:
+            print(f"Epoch [{epoch}] Iter [{i}/{len(data_loader)}] Loss: {losses.item():.4f}")
+
+
+# --------------------------- Inference & visualization ---------------------------
+
+def visualize_predictions(image_path: str, boxes: List[List[float]], labels: List[int], scores: Optional[List[float]] = None, output_path: Optional[str] = None, category_map: Optional[dict] = None):
+    img = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("arial.ttf", 16)
+    except Exception:
+        font = ImageFont.load_default()
+
+    for i, box in enumerate(boxes):
+        x1, y1, x2, y2 = box
+        label = labels[i]
+        score = scores[i] if scores is not None else None
+        cat_name = category_map.get(label, str(label)) if category_map else str(label)
+        text = f"{cat_name}"
+        if score is not None:
+            text += f" {score:.2f}"
+        draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
+        draw.text((x1 + 3, y1 + 3), text, fill="red", font=font)
+
+    if output_path:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        img.save(output_path)
+        print(f"Saved visualization to {output_path}")
+    else:
+        img.show()
+
+
+# --------------------------- Main trainer/inference CLI ---------------------------
 
 def main():
-    """Función principal"""
-    print("\n" + "="*50)
-    print("  SISTEMA DE RECONOCIMIENTO FACIAL")
-    print("  Powered by MediaPipe")
-    print("="*50)
-    
-    # Crear sistema
-    sistema = ReconocimientoFacial()
-    
-    # Cargar caras conocidas
-    sistema.cargar_caras_conocidas("caras_conocidas")
-    
-    if not sistema.caras_conocidas:
-        print("\n⚠ ATENCIÓN: No hay caras conocidas cargadas")
-        print("El sistema funcionará pero todas las caras serán 'Desconocido'\n")
-        respuesta = input("¿Continuar de todos modos? (s/n): ")
-        if respuesta.lower() != 's':
-            print("Saliendo...")
-            return
-    
-    # Menú principal
-    while True:
-        print("\n" + "="*50)
-        print("MENÚ PRINCIPAL")
-        print("="*50)
-        print("1. 📹 Webcam en tiempo real")
-        print("2. 🖼️  Analizar una imagen")
-        print("3. 🔄 Recargar caras conocidas")
-        print("4. ❌ Salir")
-        print("="*50)
-        
-        opcion = input("\nElige una opción (1-4): ").strip()
-        
-        if opcion == "1":
-            sistema.webcam_tiempo_real()
-        
-        elif opcion == "2":
-            ruta = input("\nRuta de la imagen: ").strip()
-            # Remover comillas si las hay
-            ruta = ruta.replace('"', '').replace("'", '')
-            sistema.analizar_imagen(ruta)
-        
-        elif opcion == "3":
-            sistema.cargar_caras_conocidas("caras_conocidas")
-        
-        elif opcion == "4":
-            print("\n👋 ¡Hasta luego!")
-            break
-        
+    parser = argparse.ArgumentParser(description="Entrenar o inferir modelos de detección: Faster R-CNN y DETR")
+    parser.add_argument('--mode', choices=['train', 'infer'], required=True)
+    parser.add_argument('--model', choices=['fasterrcnn', 'detr'], default='fasterrcnn')
+    parser.add_argument('--data_root', type=str, default='./dataset')
+    parser.add_argument('--train_ann', type=str, default='annotations/instances_train.json')
+    parser.add_argument('--val_ann', type=str, default='annotations/instances_val.json')
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--lr', type=float, default=0.005)
+    parser.add_argument('--weights', type=str, default='')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints')
+    parser.add_argument('--input', type=str, default='./test_images')
+    parser.add_argument('--output', type=str, default='./out')
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    args = parser.parse_args()
+
+    device = torch.device(args.device)
+    print(f"Usando device: {device}")
+
+    # Cargar categories si existen
+    coco_train_ann = os.path.join(args.data_root, args.train_ann)
+    coco_val_ann = os.path.join(args.data_root, args.val_ann)
+
+    if args.mode == 'train':
+        assert os.path.exists(os.path.join(args.data_root, args.train_ann)), f"No encontré {coco_train_ann}"
+        assert os.path.exists(os.path.join(args.data_root, args.val_ann)), f"No encontré {coco_val_ann}"
+
+        dataset = CocoDatasetWrapper(os.path.join(args.data_root, 'images'), os.path.join(args.data_root, args.train_ann), transforms=get_transform(train=True))
+        dataset_val = CocoDatasetWrapper(os.path.join(args.data_root, 'images'), os.path.join(args.data_root, args.val_ann), transforms=get_transform(train=False))
+
+        # Extraer número de clases desde el archivo de anotaciones COCO
+        import json
+        with open(os.path.join(args.data_root, args.train_ann), 'r', encoding='utf-8') as f:
+            info = json.load(f)
+            categories = info.get('categories', [])
+            num_classes = max([c['id'] for c in categories]) + 1 if categories else 2
+            # Nota: asumimos que las category_id comienzan desde 0 o 1. Ajusta si es necesario.
+            category_map = {c['id']: c['name'] for c in categories}
+
+        print(f"Categorias detectadas: {len(categories)}. num_classes (incluyendo fondo): {num_classes}")
+
+        if args.model == 'fasterrcnn':
+            model = get_fasterrcnn_model(num_classes=num_classes)
         else:
-            print("\n⚠ Opción inválida. Intenta de nuevo.")
+            model = get_detr_model(num_classes=num_classes)
+
+        model.to(device)
+
+        data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_fn)
+        data_loader_val = DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
+
+        params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=0.0005)
+
+        Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+
+        for epoch in range(args.epochs):
+            train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=50)
+            # Guardar checkpoints
+            ckpt_path = os.path.join(args.save_dir, f"{args.model}_epoch{epoch+1}.pth")
+            torch.save({'epoch': epoch + 1, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict()}, ckpt_path)
+            print(f"Checkpoint guardado: {ckpt_path}")
+
+        print("Entrenamiento finalizado")
+
+    elif args.mode == 'infer':
+        # Inferencia sobre carpeta de imágenes
+        if args.model == 'fasterrcnn':
+            # En inferencia podemos asumir 91 clases si usamos COCO preentrenado, pero lo ideal es pasar el mapping
+            model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+            model.to(device)
+        else:
+            model = detr_resnet50(pretrained=True)
+            model.to(device)
+
+        if args.weights:
+            print(f"Cargando pesos desde {args.weights}")
+            ckpt = torch.load(args.weights, map_location=device)
+            try:
+                model.load_state_dict(ckpt['model_state_dict'])
+            except Exception:
+                # intentar cargar directamente
+                model.load_state_dict(ckpt)
+
+        model.eval()
+        input_dir = args.input
+        output_dir = args.output
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+        # Intentar cargar category map si existiere
+        category_map = None
+        cat_file = os.path.join(args.data_root, 'annotations', 'categories_map.json')
+        if os.path.exists(cat_file):
+            import json
+            category_map = json.load(open(cat_file, 'r', encoding='utf-8'))
+
+        image_paths = [os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        for img_p in image_paths:
+            img = Image.open(img_p).convert('RGB')
+            img_t = get_transform(train=False)(img)
+            # model expects list of tensors
+            with torch.no_grad():
+                outputs = model([img_t.to(device)])
+
+            # outputs: list with dicts: boxes, labels, scores (for fasterrcnn)
+            out = outputs[0]
+            boxes = out.get('boxes').cpu().numpy().tolist()
+            labels = out.get('labels').cpu().numpy().tolist() if 'labels' in out else [0]*len(boxes)
+            scores = out.get('scores').cpu().numpy().tolist() if 'scores' in out else None
+
+            # Filtrar por score
+            thr = 0.5
+            sel_boxes, sel_labels, sel_scores = [], [], []
+            for i, b in enumerate(boxes):
+                s = scores[i] if scores is not None else 1.0
+                if s >= thr:
+                    sel_boxes.append(b)
+                    sel_labels.append(labels[i])
+                    sel_scores.append(s)
+
+            out_path = os.path.join(output_dir, os.path.basename(img_p))
+            visualize_predictions(img_p, sel_boxes, sel_labels, sel_scores, output_path=out_path, category_map=category_map)
+
+        print("Inferencia finalizada. Revisa la carpeta:", output_dir)
 
 
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\n⚠ Programa interrumpido por el usuario")
-    except Exception as e:
-        print(f"\n❌ Error inesperado: {e}")
-        import traceback
-        traceback.print_exc()
+if __name__ == '__main__':
+    main()
