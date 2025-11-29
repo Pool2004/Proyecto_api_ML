@@ -97,11 +97,11 @@ def generate_image(index, split):
         objects.append((CLASSES.index(obj_type), bbox))
 
     # Guardar imagen
-    img_path = f"../data/{split}/images/{index}.jpg"
+    img_path = f"./data/{split}/images/{index}.jpg"
     img.save(img_path)
 
     # Guardar label
-    label_path = f"../data/{split}/labels/{index}.txt"
+    label_path = f"./data/{split}/labels/{index}.txt"
     with open(label_path, "w") as f:
         for cls_id, (cx, cy, w, h) in objects:
             f.write(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
@@ -110,8 +110,8 @@ def generate_image(index, split):
 def setup_directories():
     """Crea carpetas del dataset."""
     for split in ["train", "val"]:
-        os.makedirs(f"../data/{split}/images", exist_ok=True)
-        os.makedirs(f"../data/{split}/labels", exist_ok=True)
+        os.makedirs(f"./data/{split}/images", exist_ok=True)
+        os.makedirs(f"./data/{split}/labels", exist_ok=True)
 
 
 def main():

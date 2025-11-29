@@ -7,9 +7,9 @@ def main():
     # Entrenamiento (fine-tuning)
     results = model.train(
         data="../config/data.yaml",
-        epochs=50,
+        epochs=10,
         imgsz=640,
-        batch=16,
+        batch=8,
         name="yolo-botellas-latas-marcadores",
         pretrained=True
     )
