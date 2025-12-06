@@ -1,0 +1,9 @@
+path: dataset/hand_keypoint_dataset
+
+train: images/train
+val: images/val
+
+kpt_shape: [21, 3]
+
+names:
+  0: hand
