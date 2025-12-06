@@ -1,4 +1,4 @@
-path: dataset/hand_keypoint_dataset
+path: ../dataset/hand_keypoint_dataset
 
 train: images/train
 val: images/val
